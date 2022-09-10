@@ -3,8 +3,10 @@
 #include <SPI.h>
 #include <nRF24L01.h>
 #include <RF24.h>
+#include <U8g2lib.h>
 
-//#define DEBUG
+#define DEBUG
+//#define SHOW_OUPUT
 
 #define THROTTLE_PIN      A0
 #define YAW_PIN           A1
@@ -22,6 +24,8 @@
 #define NRF_CE_PIN        9
 #define NRF_CSN_PIN       10
 
+#define PROJECT_NAME            "AffoFly2 TX"
+#define PROJECT_VERSION         "v0.100"
 #define BUTTON_COUNT            4
 #define BUTTON_DEBOUNCE_MS      5
 #define RADIO_PIPE              0xE8E8F0F0E1LL
@@ -35,6 +39,8 @@
 #define PPM_FRAME_LENGTH        20000
 #define PPM_PULSE_LENGTH        400
 #define CHANNEL_COUNT           8
+#define V_BAT_ALARM_VOLTAGE     3.5
+#define WELCOME_SCREEN_DURATION 2000    //2 seconds
 
 struct ControlData {
   uint32_t Token;
@@ -51,6 +57,7 @@ struct ControlData {
 Bounce bounces[BUTTON_COUNT];
 RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
 ControlData controlData;
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* clock=*/ SCL, /* data=*/ SDA, /* reset=*/ U8X8_PIN_NONE);
 
 uint16_t PPM[CHANNEL_COUNT];
 int16_t JOYSTICK_THROTTLE_OFFSET = 0;
@@ -62,6 +69,16 @@ uint8_t aux2State = 0;
 uint8_t aux3State = 0;
 uint8_t aux4State = 0;
 
+float BATTERY_VOLTAGE = 0;
+bool LOW_VOLTAGE = false;
+// set to your voltage divider resistor values
+// voltage is taken on R2
+uint32_t voltageDividerR1 = 200000;
+uint32_t voltageDividerR2 = 10000;
+// if voltage is off, use this value as percentage to shift up or down
+// theoretically you can leave it "0" if your resistor is acurate enough
+int8_t adjustment = 0;
+
 uint32_t currentTime = 0;
 uint16_t reportPerformanceInterval = 1000;
 uint32_t lastReportPerformanceMillis = 0;
@@ -71,12 +88,18 @@ uint16_t readControllerInterval = 20;
 uint32_t lastReadControllerMillis = 0;
 uint16_t sendRadioInterval = 0;
 uint32_t lastSendRadioMillis = 0;
+uint16_t readBatteryVoltageInterval = 1000;
+uint32_t lastReadBatteryVoltageMillis = 0;
+uint16_t refreshControlScreenInterval = 100;
+uint32_t lastRefreshControlScreenMillis = 0;
 
 uint16_t loopCount = 0;
 uint16_t buttonCheckCount = 0;
 uint16_t readControllerCount = 0;
 uint16_t radioCount = 0;
 uint32_t ppmCount = 0;
+uint16_t batteryCount = 0;
+uint16_t screenCount = 0;
 
 void setup() {
   ADCSRA = (ADCSRA & 0xf8) | 0x04;  // set 16 times division to make analogRead faster
@@ -85,6 +108,8 @@ void setup() {
   Serial.println("System starting...");
 #endif
   Button_init();
+  Screen_init();
+  Screen_showWelcomeScreen();
   Controller_calibrate();
   Radio_init();
   CPPM_init();
@@ -104,7 +129,15 @@ void loop() {
     lastSendRadioMillis = currentTime;
     Radio_output();
   }
-  
+  if (currentTime - lastReadBatteryVoltageMillis >= readBatteryVoltageInterval) {
+    lastReadBatteryVoltageMillis = currentTime;
+    Battery_read();
+  }
+  if (currentTime - lastRefreshControlScreenMillis >= refreshControlScreenInterval) {
+    lastRefreshControlScreenMillis = currentTime;
+    Screen_showControlScreen();
+  }
+
   loopCount++;
 
 #ifdef DEBUG
@@ -218,7 +251,7 @@ void Controller_read() {
   controlData.Aux4 = mapContollerValue(aux4State * 1023, 0, 511, 1023, false);
 
   readControllerCount++;
-#ifdef DEBUG
+#ifdef SHOW_OUPUT
   Serial.print("Throttle: ");     Serial.print(controlData.Throttle);   Serial.print("    ");
   Serial.print("Yaw: ");          Serial.print(controlData.Yaw);        Serial.print("    ");
   Serial.print("Pitch: ");        Serial.print(controlData.Pitch);      Serial.print("    ");
@@ -303,18 +336,77 @@ void Radio_output() {
   radioCount++;
 }
 
+void Screen_init() {
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_profont12_tr);
+}
+
+void Screen_showWelcomeScreen() {
+  u8g2.firstPage();
+  do {
+    u8g2.drawStr(30, 30, PROJECT_NAME);
+    u8g2.drawStr(40, 50, PROJECT_VERSION);
+  } while (u8g2.nextPage());
+  delay(WELCOME_SCREEN_DURATION);
+}
+
+void Screen_showControlScreen() {
+  u8g2.firstPage();
+  do {
+    // Battery Voltage
+    if (LOW_VOLTAGE) {
+      u8g2.setFontMode(1);
+      u8g2.drawBox(0, 0, 25, 12);
+      u8g2.setDrawColor(2);
+    }
+    u8g2.setCursor(1, 10);
+    u8g2.print(BATTERY_VOLTAGE);
+    u8g2.setCursor(26, 10);
+    u8g2.print("v");
+    if (LOW_VOLTAGE) {
+      u8g2.setFontMode(0);
+      u8g2.setDrawColor(1);
+    }
+  }while (u8g2.nextPage());
+
+  screenCount++;
+}
+
+void Battery_read() {
+  float resolutionVoltage = 0.00107422; // AREF(1.1v) / 1024
+  analogReference(INTERNAL);
+  uint16_t vReading = analogRead(V_BAT_PIN);
+  delay(5); //Based on my testing 5ms the reading reaches stable state
+  vReading = analogRead(V_BAT_PIN);
+  analogReference(DEFAULT);
+  BATTERY_VOLTAGE = (vReading * resolutionVoltage * ((voltageDividerR1 + voltageDividerR2) / voltageDividerR2) * (100 + adjustment)) / 100;
+#ifdef DEBUG
+  Serial.print("V_BAT: "); Serial.println(BATTERY_VOLTAGE);
+#endif
+
+  if (BATTERY_VOLTAGE <= V_BAT_ALARM_VOLTAGE) {
+    LOW_VOLTAGE = true;
+  }
+
+  batteryCount++;
+}
+
 void reportPerformance() {
   Serial.print("Loop: ");       Serial.print(loopCount);            Serial.print("    ");
   Serial.print("Button: ");     Serial.print(buttonCheckCount);     Serial.print("    ");
   Serial.print("Controller: "); Serial.print(readControllerCount);  Serial.print("    ");
   Serial.print("Radio: ");      Serial.print(radioCount);           Serial.print("    ");
   Serial.print("PPM: ");        Serial.print(ppmCount);             Serial.print("    ");
+  Serial.print("Battery: ");    Serial.print(batteryCount);         Serial.print("    ");
+  Serial.print("Screen: ");     Serial.print(screenCount);          Serial.print("    ");
   Serial.println();
   loopCount = 0;
   buttonCheckCount = 0;
   readControllerCount = 0;
   radioCount = 0;
   ppmCount = 0;
+  batteryCount = 0;
+  screenCount = 0;
 }
 
 ISR(TIMER1_COMPA_vect) {
@@ -326,7 +418,7 @@ ISR(TIMER1_COMPA_vect) {
   PPM[5] = controlData.Aux2;
   PPM[6] = controlData.Aux3;
   PPM[7] = controlData.Aux4;
-  
+
   static boolean state = true;
   TCNT1 = 0;
   if ( state ) {
